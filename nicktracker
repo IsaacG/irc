@@ -1,0 +1,119 @@
+#!/bin/bash
+
+max=4
+# Set $db $max $irclogdir $ignorenick
+. ~/.nicktracker.rc
+
+# Reset the DB, deleting all values
+reset_db () {
+  {
+    echo 'DELETE FROM nick_host;'
+    echo 'DELETE FROM nick_change;'
+  } | sqlite3 "$db"
+}
+
+# Add new entries to the DB by parsing the logfile to get JOINS/QUITS/PARTS/NICKS
+update_db () {
+  awk -vignore="$ignorenick" '
+    $2 == "-*-" && $5 == "has" && ( $6 == "joined." || $6 == "left" || $6 == "quit" ) && $3 !~ ignore {
+      nick = substr($3, 1, length($3) - 1)
+      host = $4
+      sub(/.*@/, "", host)
+      host = substr(host, 1, length(host) - 1)
+      printf "INSERT OR IGNORE INTO nick_host (nick, host) VALUES (\"%s\", \"%s\");\n", nick, host;
+    }
+    $2 == "-*-" && $4 $5 $6 $7 == "isnowknownas" {
+      old = substr($3, 1, length($3) - 1)
+      new = $8
+      if (old ~ ignore || new ~ ignore) next;
+      if (old > new) { a = old; old = new; new = a; }
+    printf "INSERT OR IGNORE INTO nick_change (old, new) VALUES (\"%s\", \"%s\");\n", old, new;
+    }
+    ' "$1" | sort -u | tee >( sqlite3 "$db" )
+}
+
+# Create the DB. This is the DB schema.
+create_db () {
+  {
+    echo 'CREATE TABLE nick_change (old TEXT NOT NULL, new TEXT NOT NULL);'
+    echo 'CREATE UNIQUE INDEX i_nc ON nick_change (old, new);'
+    echo 'CREATE TABLE nick_host (nick TEXT NOT NULL, host TEXT NOT NULL);'
+    echo 'CREATE UNIQUE INDEX i_nh ON nick_host (nick, host);'
+  } | sqlite3 "$db"
+}
+
+# Convert a shell-list of nicks to a SQL-list
+nick_list () {
+  printf '('; printf '"%s",' "${nicks[@]}"; printf '"")'
+}
+
+# Expand a set of nicks to a larger set by following nick changes.
+nick_change_exp () {
+  new=( "$@" )
+  nicks=()
+
+  n=1
+  while (( n++ < max )) && (( ${#nicks[@]} != ${#new[@]} )); do
+    nicks=( "${new[@]}" )
+    list=$(nick_list "${nicks[@]}")
+    printf -vq '.separator "\\n"\nSELECT * FROM nick_change WHERE old IN %s or new IN %s;\n' "$list" "$list"
+    IFS=$'\n' new=( $(sqlite3 "$db" <<< "$q" | sort -u) )
+    if (( ${#new[@]} < ${#nicks[@]})); then
+      new=( "${nicks[@]}" )
+      break
+    fi
+  done
+  echo "${new[@]}"
+}
+
+# Expand a set of nicks to a larger set by using hostname matching.
+nick_host_exp () {
+  new=( "$@" )
+  nicks=()
+
+  n=1
+  while (( n++ < max )) && (( ${#nicks[@]} != ${#new[@]} )); do
+    nicks=( "${new[@]}" )
+    list=$(nick_list "${nicks[@]}")
+    printf -vq '.separator "\\n"\nSELECT b.nick FROM nick_host AS a JOIN nick_host AS b ON a.host = b.host WHERE a.nick IN %s;' "$list"
+    IFS=$'\n' new=( $(sqlite3 "$db" <<< "$q" | sort -u) )
+    if (( ${#new[@]} < ${#nicks[@]})); then
+      new=( "${nicks[@]}" )
+      break
+    fi
+  done
+  echo "${new[@]}"
+}
+
+# Perform both sorts of expansions a bunch of times.
+expand () {
+  new=( "$@" )
+  nicks=()
+
+  n=1
+  while (( n++ < max )) && (( ${#nicks[@]} != ${#new[@]} )); do
+    nicks=( "${new[@]}" )
+    new=( $(nick_host_exp "${new[@]}") )
+    new=( $(nick_change_exp "${new[@]}") )
+  done
+  echo "${new[@]}"
+}
+
+# Create the DB if it does not exist yet.
+[[ -e "$db" ]] || create_db
+
+if [[ $1 = "build" ]] && [[ -r "$2" ]]; then
+  # Build a DB from scratch.
+  reset_db
+  update_db "$2"
+elif [[ $1 = "dailyupdate" ]]; then
+  # Add yesterday's data to the DB (via cron typically).
+  path=$(printf '%s/%s.log\n' "$irclogdir" "$(date -d 'yesterday' +%y%m%d)")
+  update_db "$path"
+elif [[ $1 = "update" ]] && [[ -r "$2" ]]; then
+  # Update the DB with a logfile.
+  update_db "$2"
+else
+  # Expand a nickname.
+  expand "$@"
+fi
